@@ -58,7 +58,7 @@ EMAILS_NOTIFICACION = os.getenv("EMAILS_NOTIFICACION") or "notificaciones@dummy.
 
 # Producto
 SUSCRIPCION_NOMBRE    = "Suscripción a STATS por 30 dias"
-SUSCRIPCION_MONTO_USD = 25.00
+SUSCRIPCION_MONTO_USD = 30.00
 
 # Archivos CSV
 CSV_LINKS   = "links_wompi.csv"
