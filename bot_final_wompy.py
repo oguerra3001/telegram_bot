@@ -21,7 +21,7 @@ Variables de entorno (.env):
   CHANNEL_ID=-100XXXXXXXXXX
 """
 
-import os, csv, time, json
+import os, csv, time, json, re  # ### MODIFICADO: agregado re para referidos
 from datetime import datetime, timedelta, timezone
 import httpx
 from dotenv import load_dotenv
@@ -64,6 +64,7 @@ SUSCRIPCION_MONTO_USD = 30.00
 CSV_LINKS   = "links_wompi.csv"
 CSV_VALID   = "validaciones_wompi.csv"
 CSV_PHONES  = "telefonos.csv"
+CSV_REFS    = "referidos.csv"   # ### AGREGADO: persistencia de referidos
 
 # ===== Util CSV =====
 def _ensure_headers(path: str, headers: list[str]) -> None:
@@ -74,12 +75,12 @@ def _ensure_headers(path: str, headers: list[str]) -> None:
 def append_link_row(row: dict) -> None:
     _ensure_headers(
         CSV_LINKS,
-        ["timestamp_utc","user_id","chat_id","username","referencia","idEnlace","urlEnlace","monto_usd","estado_inicial"],
+        ["timestamp_utc","user_id","chat_id","username","ref_code","referencia","idEnlace","urlEnlace","monto_usd","estado_inicial"],  # ### MODIFICADO: agregado ref_code
     )
     with open(CSV_LINKS, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["timestamp_utc","user_id","chat_id","username","referencia","idEnlace","urlEnlace","monto_usd","estado_inicial"]
+            fieldnames=["timestamp_utc","user_id","chat_id","username","ref_code","referencia","idEnlace","urlEnlace","monto_usd","estado_inicial"]  # ### MODIFICADO: agregado ref_code
         )
         writer.writerow(row)
 
@@ -105,6 +106,52 @@ def upsert_phone(user_id: int, chat_id: int, username: str, phone: str) -> None:
             "username": username,
             "phone_number": phone
         })
+
+
+
+# ===== Referidos (links con 4 letras) =====  # ### AGREGADO
+REF_RE = re.compile(r"^[A-Za-z]{4}$")  # exactamente 4 letras
+
+def extract_ref_code(payload: str | None) -> str | None:  # ### AGREGADO
+    """Extrae el código de referido desde /start ABCD (4 letras)."""
+    if not payload:
+        return None
+    payload = payload.strip()
+    if REF_RE.fullmatch(payload):
+        return payload.upper()
+    return None
+
+def upsert_ref(user_id: int, chat_id: int, username: str, ref_code: str) -> None:  # ### AGREGADO
+    _ensure_headers(CSV_REFS, ["timestamp_utc","user_id","chat_id","username","ref_code"])
+    with open(CSV_REFS, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["timestamp_utc","user_id","chat_id","username","ref_code"])
+        writer.writerow({
+            "timestamp_utc": datetime.utcnow().isoformat(),
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "username": username,
+            "ref_code": ref_code
+        })
+
+def get_user_ref(user_id: int) -> str | None:  # ### AGREGADO
+    """Devuelve el último ref_code registrado para este usuario (si existe)."""
+    if not os.path.isfile(CSV_REFS):
+        return None
+    last = None
+    with open(CSV_REFS, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if str(row.get("user_id")) == str(user_id):
+                rc = (row.get("ref_code") or "").strip()
+                if rc:
+                    last = rc.upper()
+    return last
+
+def build_wompi_reference(user_id: int, ref_code: str | None) -> str:  # ### AGREGADO
+    """Construye un identificador que incluya el ref (4 letras) dentro del código del enlace."""
+    rc = (ref_code or "NONE").upper()
+    # Mantenerlo corto y seguro para la pasarela:
+    return f"tg_{user_id}_{rc}_{int(time.time())}"
 
 def _parse_utc_iso(ts: str) -> datetime:
     try:
@@ -246,6 +293,18 @@ async def crear_invite_link(context: ContextTypes.DEFAULT_TYPE, chat_id: int, ho
 
 # ===== Bot Handlers =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ### AGREGADO: capturar referido desde el parámetro /start ABCD
+    user = update.effective_user
+    chat = update.effective_chat
+
+    payload = context.args[0] if context.args else None
+    ref_code = extract_ref_code(payload)
+
+    if ref_code:
+        # Persistir y también guardarlo en memoria de sesión (user_data)
+        context.user_data["ref_code"] = ref_code
+        upsert_ref(user.id, chat.id, user.username or "sin_username", ref_code)
+
     await update.message.reply_text(
         "👋 ¡Bienvenido! Soy el bot de suscripciones STATS.\n\n"
         "Para unirte al canal haz clic en:\n"
@@ -295,7 +354,9 @@ async def recibir_contacto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Generar y enviar enlace ahora
-    referencia = f"tg_{user.id}_{int(time.time())}"
+    # ### AGREGADO: incluir el referido (4 letras) dentro del código del enlace
+    ref_code = context.user_data.get("ref_code") or get_user_ref(user.id)
+    referencia = build_wompi_reference(user.id, ref_code)
     try:
         data = crear_enlace_pago(referencia, SUSCRIPCION_MONTO_USD, SUSCRIPCION_NOMBRE)
     except Exception as e:
@@ -311,6 +372,7 @@ async def recibir_contacto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "user_id": user.id,
         "chat_id": chat.id,
         "username": user.username or "sin_username",
+        "ref_code": (ref_code or ""),  # ### AGREGADO
         "referencia": referencia,
         "idEnlace": id_enlace,
         "urlEnlace": url_enlace,
